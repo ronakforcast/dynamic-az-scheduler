@@ -1,0 +1,99 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: az-check-script
+data:
+  check-az.sh: |
+    #!/bin/sh
+    AZ_LIST="us-east-1a,us-east-1b,us-east-1c"
+    AVAILABLE_ZONE=""
+
+    mkdir -p az-availability
+
+    while true; do
+    for az in $(echo $AZ_LIST | tr "," " "); do
+    state=$(aws ec2 describe-availability-zones --region ${az:0:9} --query "AvailabilityZones[?ZoneName=='$az'].State" --output text)
+    echo "$state" > az-availability/$az
+    cat az-availability/$az
+
+    if [ "$state" == "available" ]; then
+        AVAILABLE_ZONE=$az
+        break
+    fi
+    done
+
+    if [ -z "$AVAILABLE_ZONE" ]; then
+    echo "No available zones found."
+    # Handle no available zones case
+    else
+    echo "Available zone found: $AVAILABLE_ZONE"
+    fi
+
+    echo -e "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: az-availability\ndata:\n  zone: $AVAILABLE_ZONE" | kubectl apply -f -
+
+    echo 'Sleeping for 60 seconds...'
+    sleep 60
+    done
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: az-checker
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: az-checker-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create", "update", "get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: az-checker-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: az-checker
+roleRef:
+  kind: Role
+  name: az-checker-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: az-checker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: az-checker
+  template:
+    metadata:
+      labels:
+        app: az-checker
+    spec:
+      serviceAccountName: az-checker
+      containers:
+      - name: az-checker
+        image: bearengineer/awscli-kubectl
+        command: ["/bin/sh"]
+        args: ["-c", "aws --version && kubectl version --client && /scripts/check-az.sh"]
+        env:
+        - name: AWS_DEFAULT_REGION
+          value: "us-east-1"
+        volumeMounts:
+        - name: az-check-script
+          mountPath: /scripts
+      volumes:
+      - name: az-check-script
+        configMap:
+          name: az-check-script
+          defaultMode: 511
